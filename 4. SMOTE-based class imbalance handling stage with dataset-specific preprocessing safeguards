@@ -1,0 +1,154 @@
+import pandas as pd
+import numpy as np
+from imblearn.over_sampling import SMOTE
+import warnings
+warnings.filterwarnings("ignore")
+
+print("=" * 60)
+print("SMOTE — all four datasets (loaded from parquet)")
+print("=" * 60)
+
+
+# ================================================================
+# LOAD PREPROCESSED SPLITS
+# ================================================================
+X_kdd_train       = pd.read_parquet("kdd99_train.parquet")
+y_kdd_train       = pd.read_parquet("kdd99_train_labels.parquet").iloc[:, 0]
+
+df_nsl_train      = pd.read_parquet("nsl_train.parquet")
+nsl_feature_cols  = [c for c in df_nsl_train.columns
+                     if c not in ["label", "label_cat", "binary_label"]]
+X_nsl             = df_nsl_train[nsl_feature_cols]
+y_nsl             = df_nsl_train["label_cat"]
+
+df_unsw_T0        = pd.read_parquet("unsw_T0.parquet")
+df_ton_train      = pd.read_parquet("ton_train.parquet")
+
+print(f"  KDD'99 train    : {X_kdd_train.shape}")
+print(f"  NSL-KDD train   : {X_nsl.shape}")
+print(f"  UNSW-NB15 T0    : {df_unsw_T0.shape}")
+print(f"  ToN-IoT train   : {df_ton_train.shape}\n")
+
+
+# ================================================================
+# SAFE SMOTE HELPER — preserves column names
+# ================================================================
+def safe_smote(X, y, dataset_name):
+    # Store column names before SMOTE (numpy conversion loses them)
+    col_names = X.columns.tolist() if hasattr(X, 'columns') else None
+
+    print(f"  {dataset_name} before SMOTE:")
+    print(pd.Series(y).value_counts().to_string())
+
+    min_samples = pd.Series(y).value_counts().min()
+    if min_samples < 2:
+        print(f"  [SKIP] A class has only {min_samples} sample — cannot apply SMOTE\n")
+        return X, y
+
+    k = min(5, min_samples - 1)
+    print(f"  k_neighbors = {k}")
+    sm = SMOTE(random_state=42, k_neighbors=k)
+    X_sm, y_sm = sm.fit_resample(X, y)
+
+    # Restore column names
+    if col_names:
+        X_sm = pd.DataFrame(X_sm, columns=col_names)
+
+    print(f"  {dataset_name} after SMOTE:")
+    print(pd.Series(y_sm).value_counts().to_string())
+    print(f"  Shape : {X_sm.shape}\n")
+    return X_sm, y_sm
+
+
+# ================================================================
+# KDD'99 — multiclass (dos / probe / r2l / u2r / normal)
+# ================================================================
+X_kdd_sm, y_kdd_sm = safe_smote(X_kdd_train, y_kdd_train, "KDD'99")
+
+X_kdd_sm.to_parquet("kdd99_train_smote.parquet")
+pd.Series(y_kdd_sm, name="label_cat").to_frame().to_parquet(
+    "kdd99_train_smote_labels.parquet")
+
+
+# ================================================================
+# NSL-KDD — multiclass
+# ================================================================
+X_nsl_sm, y_nsl_sm = safe_smote(X_nsl, y_nsl, "NSL-KDD")
+
+X_nsl_sm.to_parquet("nsl_train_smote.parquet")
+pd.Series(y_nsl_sm, name="label_cat").to_frame().to_parquet(
+    "nsl_train_smote_labels.parquet")
+
+
+# ================================================================
+# UNSW-NB15 T0 — binary (downsample normal first to avoid MemoryError)
+# ================================================================
+y_unsw = df_unsw_T0["binary_label"]
+unsw_feat_cols = [c for c in df_unsw_T0.columns
+                  if c not in ["attack_cat", "binary_label"]]
+
+# Downsample normal class before SMOTE
+X_normal = df_unsw_T0[y_unsw == 0][unsw_feat_cols]
+X_attack = df_unsw_T0[y_unsw == 1][unsw_feat_cols]
+y_normal = y_unsw[y_unsw == 0]
+y_attack = y_unsw[y_unsw == 1]
+
+X_normal_down = X_normal.sample(n=min(120_000, len(X_normal)), random_state=42)
+y_normal_down = y_normal.loc[X_normal_down.index]
+
+X_unsw = pd.concat([X_normal_down, X_attack], ignore_index=True)
+y_unsw_down = pd.concat([y_normal_down, y_attack], ignore_index=True)
+
+print(f"  UNSW-NB15 after downsampling normal:")
+print(f"  Normal : {(y_unsw_down==0).sum():,}  |  Attack : {(y_unsw_down==1).sum():,}\n")
+
+X_unsw_sm, y_unsw_sm = safe_smote(X_unsw, y_unsw_down, "UNSW-NB15 T0 (binary)")
+
+X_unsw_sm.to_parquet("unsw_T0_smote_binary.parquet")
+pd.Series(y_unsw_sm, name="binary_label").to_frame().to_parquet(
+    "unsw_T0_smote_binary_labels.parquet")
+
+
+# ================================================================
+# ToN-IoT — binary
+# FIX: label column contains attack type names (e.g. 'ddos', 'normal')
+#      so map 'normal' → 0, everything else → 1
+# ================================================================
+ton_feat_cols = [c for c in df_ton_train.columns
+                 if c not in ["label", "type", "binary_label"]]
+X_ton = df_ton_train[ton_feat_cols]
+
+# label column has attack type strings — convert to binary
+y_ton_raw = df_ton_train["label"]
+print(f"  ToN-IoT label column sample: {y_ton_raw.unique()[:5]}")
+
+# If it contains strings like 'ddos', map normal→0, else→1
+if y_ton_raw.dtype == object:
+    y_ton = (y_ton_raw.str.strip().str.lower() != "normal").astype(int)
+else:
+    y_ton = y_ton_raw.astype(int)
+
+print(f"  ToN-IoT label check (should show 0 and 1 only):")
+print(f"{y_ton.value_counts().to_string()}\n")
+
+X_ton_sm, y_ton_sm = safe_smote(X_ton, y_ton, "ToN-IoT (binary)")
+
+X_ton_sm.to_parquet("ton_train_smote_binary.parquet")
+pd.Series(y_ton_sm, name="binary_label").to_frame().to_parquet(
+    "ton_train_smote_binary_labels.parquet")
+
+# ================================================================
+# SUMMARY
+# ================================================================
+print("=" * 60)
+print("SAVED FILES")
+print("=" * 60)
+print("  kdd99_train_smote.parquet          ✓")
+print("  kdd99_train_smote_labels.parquet   ✓")
+print("  nsl_train_smote.parquet            ✓")
+print("  nsl_train_smote_labels.parquet     ✓")
+print("  unsw_T0_smote_binary.parquet       ✓")
+print("  unsw_T0_smote_binary_labels.parquet✓")
+print("  ton_train_smote_binary.parquet     ✓")
+print("  ton_train_smote_binary_labels.parquet ✓")
+print("\n  SMOTE COMPLETE — paste output for verification")
